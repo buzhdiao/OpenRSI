@@ -1,15 +1,31 @@
+# =====================================================================
+# 中文注释导读（OpenRSI / OpenMLE-Gym 学习文档）：
+# 本文件是 OpenMLE-Gym 的"任务构建"编排入口：把一批比赛 slug（如 Kaggle
+# competition 名）批量构建成可执行、可评估的 MLE 任务包。
+# 关键设计：
+#   1) MLEBENCH_SLUGS 白名单：默认跳过 MLE-Bench 已收录的比赛（避免评测污染，
+#      保证训练数据与评测基准去重，对应论文"duplicate against all evaluation
+#      benchmarks"的去重原则）；
+#   2) 进程隔离构建：每个任务在独立子进程中执行（run_task_process），互不污染，
+#      并按 只读/可写 路径白名单限制文件访问；
+#   3) 异步并发 + 信号量限流：max_concurrency 控制同时构建的任务数；
+#   4) Preflight 预检：任务名合法性、重名检测、输出路径越界检测在分派前完成。
+# 构建产出的任务包（data/forge/downloads）之后由 local_evaluator.py 做质量评估。
+# =====================================================================
 from __future__ import annotations
 
-import asyncio
-import sys
-from datetime import datetime
-from pathlib import Path
+import asyncio  # 并发编排：信号量限流 + gather
+import sys  # 子进程 stderr 转发
+from datetime import datetime  # 批次名默认用时间戳
+from pathlib import Path  # 路径与"越界"检查
 from typing import Any
 
-from .common import json_safe, read_slug_entries, read_slugs_file, validate_task_name
-from .process_runner import run_task_process
+from .common import json_safe, read_slug_entries, read_slugs_file, validate_task_name  # slug 读取与校验工具
+from .process_runner import run_task_process  # 进程隔离的任务执行器
 
 
+# MLE-Bench 收录的比赛 slug 集合：默认跳过它们，防止构建出与评测基准同源的任务包
+# （论文强调训练数据须对所有评测基准去重，这是去重在构建阶段的落点）
 MLEBENCH_SLUGS = {
     "3d-object-detection-for-autonomous-vehicles",
     "AI4Code",
@@ -91,10 +107,12 @@ MLEBENCH_SLUGS = {
 
 def _json_safe(value: Any) -> Any:
     """Convert legacy pipeline return objects into JSON-serializable data."""
+    # 委托 common.json_safe：把不可序列化对象（Path/异常等）转成 JSON 友好结构
     return json_safe(value)
 
 
 def _summarize_results(results: list[Any]) -> dict[str, Any]:
+    # 汇总一批构建结果：成功/失败计数与批次整体状态
     failed = 0
     succeeded = 0
     for result in results:
@@ -104,6 +122,7 @@ def _summarize_results(results: list[Any]) -> dict[str, Any]:
             else:
                 succeeded += 1
         else:
+            # 非 dict 结果一律按失败计
             failed += 1
     total = len(results)
     if total == 0:
@@ -129,6 +148,7 @@ def _dry_run(
     skip_mlebench: bool,
     delete_raw: bool,
 ) -> dict[str, Any]:
+    # 演练模式（execute=False）：只报告"会构建哪些、会跳过哪些"，不实际下载/生成
     selected = [slug for slug in slugs if not (skip_mlebench and slug in MLEBENCH_SLUGS)]
     skipped = [slug for slug in slugs if skip_mlebench and slug in MLEBENCH_SLUGS]
     return {
@@ -152,14 +172,17 @@ async def _run_one_local(
     code_execution_mode: str = "process",
     code_timeout: float = 600,
 ) -> Any:
-    from builder_core.design import Graph
-    from builder_core.utils.state import AgentState
-    from builder_core.utils.task import Task
+    # 单任务"进程内"构建路径（不走子进程隔离）：直接实例化 builder_core 的 LangGraph
+    # 流水线并异步执行。仅用于调试/受控场景，批量构建默认走 _run_all 的进程隔离。
+    from builder_core.design import Graph  # 构建流水线的图定义（下载->感知->描述->准备->指标）
+    from builder_core.utils.state import AgentState  # 图运行的全局状态
+    from builder_core.utils.task import Task  # 单个比赛任务的阶段标志位
 
     builder_path = Path(builder_root)
     output_path = Path(output_root)
     info_path = Path(info_csv)
     agent = AgentState({"messages": []})
+    # 所有阶段标志置 False：由 Graph 内部按需推进各阶段
     task = Task(
         name=slug,
         retry=retry,
@@ -201,10 +224,13 @@ async def _run_all(
     execution_mode: str,
     task_timeout: float,
 ) -> list[Any]:
-    sem = asyncio.Semaphore(max(1, max_concurrency))
+    # 批量构建主路径：每个任务派发到独立子进程（进程隔离 + 文件权限白名单）
+    sem = asyncio.Semaphore(max(1, max_concurrency))  # 并发上限（至少 1）
 
     async def worker(slug: str) -> Any:
         async with sem:
+            # run_task_process：fork 一个干净的子进程运行"build"入口，
+            # 只允许读 builder_root/info_csv，只允许写 output_root
             outcome = await asyncio.to_thread(
                 run_task_process,
                 "build",
@@ -224,6 +250,7 @@ async def _run_all(
                 readonly_paths=(builder_root, info_csv),
                 writable_paths=(output_root,),
             )
+            # 子进程 stdout/stderr 实时转发到父进程日志
             if outcome.stdout:
                 print(outcome.stdout, end="")
             if outcome.stderr:
@@ -233,6 +260,7 @@ async def _run_all(
                 and isinstance(outcome.result, dict)
                 and isinstance(outcome.result.get("success"), bool)
             ):
+                # 子进程成功且返回结构合法
                 return outcome.result
             return {
                 "name": slug,
@@ -243,10 +271,12 @@ async def _run_all(
                 ],
             }
 
+    # 并发执行全部任务；单个任务抛异常不影响其他任务
     results = await asyncio.gather(*(worker(slug) for slug in slugs), return_exceptions=True)
     normalized = []
     for slug, result in zip(slugs, results, strict=True):
         if isinstance(result, BaseException):
+            # 异常统一归一化为失败记录（带异常类型名，便于排查）
             normalized.append(
                 {
                     "name": slug,
@@ -274,14 +304,18 @@ def build_tasks(
     execution_mode: str = "process",
     task_timeout: float = 3600,
 ) -> dict[str, Any]:
+    # 【任务构建总入口】读取 slug 清单 -> 预检 -> 并发派发构建 -> 汇总报告。
+    # CLI（cli.py 的 build 子命令）直接调用本函数。
     slugs = read_slugs_file(slugs_file)
     if limit is not None:
         slugs = slugs[:limit]
     output_path = Path(output_root).resolve()
     info_path = Path(info_csv).resolve()
+    # 批次名缺省为时间戳：保证多次构建互不覆盖
     name = batch_name or f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-openmle"
     batch_path = (output_path / name).resolve()
     try:
+        # 防目录穿越：batch 名不得让批次目录逃出输出根目录
         batch_path.relative_to(output_path)
     except ValueError as exc:
         raise ValueError(f"Batch path escapes output root: {name!r}") from exc
@@ -295,6 +329,7 @@ def build_tasks(
     if not info_path.exists():
         raise FileNotFoundError(f"info.csv not found: {info_path}")
 
+    # ---- Preflight 预检：把"必然失败"的任务在派发前拦截，附上明确原因 ----
     raw_entries = read_slug_entries(slugs_file)
     selected: list[tuple[int, str]] = []
     preflight_failures: dict[int, dict[str, Any]] = {}
@@ -303,6 +338,7 @@ def build_tasks(
         if limit is not None and index >= limit:
             break
         try:
+            # 1) 任务名合法性（防止路径注入字符）
             validate_task_name(slug)
         except ValueError as exc:
             preflight_failures[index] = {
@@ -313,6 +349,7 @@ def build_tasks(
             }
             continue
         if slug in seen:
+            # 2) 重名检测：同批任务名唯一
             preflight_failures[index] = {
                 "name": slug,
                 "status": "failed",
@@ -322,6 +359,7 @@ def build_tasks(
             continue
         seen.add(slug)
         try:
+            # 3) 三个产出路径（数据/锻造/下载包）都不得逃出批次根目录
             for relative in (
                 Path("data") / slug,
                 Path("forge") / slug,
@@ -337,7 +375,9 @@ def build_tasks(
             }
             continue
         if not (skip_mlebench and slug in MLEBENCH_SLUGS):
+            # 4) MLE-Bench 去重：skip_mlebench=True 时跳过评测基准同源比赛
             selected.append((index, slug))
+    # 并发执行构建（每个任务一个隔离子进程）
     results = asyncio.run(
         _run_all(
             builder_root=builder_root,
@@ -352,6 +392,7 @@ def build_tasks(
             task_timeout=task_timeout,
         )
     )
+    # 按原始行号对齐结果：预检失败与构建结果合并成完整清单
     indexed_results = {
         index: result
         for (index, _), result in zip(selected, results, strict=True)
