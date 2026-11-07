@@ -9,14 +9,20 @@
 # See THIRD_PARTY_LICENSES.md for the full licence text.
 # https://github.com/WecoAI/aideml/blob/main/LICENSE
 
+# 抽象基类与抽象方法装饰器
 from abc import ABC, abstractmethod
+# dataclass 装饰器
 from dataclasses import dataclass
+# 面向对象的文件路径类型
 from pathlib import Path
+# 任意类型注解
 from typing import Any
 
+# 让 dataclass 具备 JSON 序列化/反序列化能力的混入类
 from dataclasses_json import DataClassJsonMixin
 
 
+# 在解释器中执行一段代码的结果（含输出、耗时与异常信息），可序列化为 JSON
 @dataclass
 class ExecutionResult(DataClassJsonMixin):
     """
@@ -24,14 +30,21 @@ class ExecutionResult(DataClassJsonMixin):
     Contains the output, execution time, and exception information.
     """
 
+    # 终端输出（stdout/stderr 逐行文本）
     term_out: list[str]
+    # 执行耗时（秒）
     exec_time: float
+    # 进程退出码，None 表示尚未退出或未获取
     exit_code: int | None = None
+    # 评估调用（如提交评测）的返回值
     eval_return: Any | None = None
+    # 是否因超时被强制终止
     timed_out: bool = False
 
+    # 构造一个"空结果"的静态工厂方法
     @staticmethod
     def get_empty():
+        # 返回所有字段均为中性默认值的 ExecutionResult
         return ExecutionResult(
             term_out=[" "],
             exec_time=0,
@@ -41,6 +54,8 @@ class ExecutionResult(DataClassJsonMixin):
         )
 
 
+# 代码解释器的抽象基类，约定接口：创建隔离的执行环境/进程、
+# 按实现执行任意语言代码、捕获并返回执行结果、清理资源
 class Interpreter(ABC):
     """
     An abstract base class defining the interface for a code interpreter that:
@@ -50,6 +65,7 @@ class Interpreter(ABC):
       - Cleans up resources (terminates processes, closes streams, etc.).
     """
 
+    # 初始化接口：子类必须实现
     @abstractmethod
     def __init__(
         self,
@@ -67,6 +83,7 @@ class Interpreter(ABC):
         """
         raise NotImplementedError("Subclasses must implement __init__()")
 
+    # 执行代码接口：子类必须实现
     @abstractmethod
     def run(
         self,
@@ -96,6 +113,7 @@ class Interpreter(ABC):
         """
         raise NotImplementedError("Subclasses must implement run()")
 
+    # 清理会话接口：终止子进程、关闭句柄等，子类必须实现
     @abstractmethod
     def cleanup_session(self) -> None:
         """
