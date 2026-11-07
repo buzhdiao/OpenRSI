@@ -9,78 +9,103 @@
 # See THIRD_PARTY_LICENSES.md for the full licence text.
 # https://github.com/WecoAI/aideml/blob/main/LICENSE
 
+# 导入 json 模块，用于解析 LLM 输出中的 JSON 片段
 import json
+# 导入 re 模块，用于正则提取
 import re
 
+# 导入 black 代码格式化库
 import black
 
 
 def wrap_code(code: str, lang="python") -> str:
     """Wraps code with three backticks."""
+    # 把代码文本包进三反引号代码围栏（lang 指定语言标识）
     return f"```{lang}\n{code}\n```"
 
 
 def is_valid_python_script(script):
     """Check if a script is a valid Python script."""
     try:
+        # 用内置 compile 只做语法检查（不执行），通过即视为合法脚本
         compile(script, "<string>", "exec")
         return True
     except SyntaxError:
+        # 语法错误则判定为非法脚本
         return False
 
 
 def extract_jsons(text):
     """Extract all JSON objects from the text. Caveat: This function cannot handle nested JSON objects."""
+    # 收集解析成功的 JSON 对象
     json_objects = []
+    # 非贪婪匹配所有 {...} 片段（DOTALL 让 . 匹配换行）
     matches = re.findall(r"\{.*?\}", text, re.DOTALL)
     for match in matches:
         try:
+            # 逐个尝试把片段解析为 JSON 对象
             json_obj = json.loads(match)
             json_objects.append(json_obj)
         except json.JSONDecodeError:
+            # 解析失败的片段直接跳过
             pass
 
     # Sometimes chatgpt-turbo forget the last curly bracket, so we try to add it back when no json is found
     if len(json_objects) == 0 and not text.endswith("}"):
+        # 一个都没解析到且文本不以 } 结尾时，尝试补上缺失的右括号再解析
         json_objects = extract_jsons(text + "}")
         if len(json_objects) > 0:
+            # 补括号后解析成功则直接返回
             return json_objects
 
+    # 返回解析出的全部 JSON 对象
     return json_objects
 
 
 def trim_long_string(string, threshold=5100, k=2500):
     # Check if the length of the string is longer than the threshold
+    # 字符串超过阈值时进行"掐头去尾"式截断
     if len(string) > threshold:
         # Output the first k and last k characters
+        # 保留开头 k 个字符
         first_k_chars = string[:k]
+        # 保留结尾 k 个字符
         last_k_chars = string[-k:]
 
+        # 计算被截掉的总字符数
         truncated_len = len(string) - 2 * k
 
+        # 返回"头 + 截断标记 + 尾"的组合
         return f"{first_k_chars}\n ... [{truncated_len} characters truncated] ... \n{last_k_chars}"
     else:
+        # 未超阈值则原样返回
         return string
 
 
 def extract_code(text):
     """Extract python code blocks from the text."""
+    # 收集提取到的代码块
     parsed_codes = []
 
     # When code is in a text or python block
+    # 匹配 ```...``` 或 ```python ...``` 代码围栏（DOTALL 跨行匹配）
     matches = re.findall(r"```(python)?\n*(.*?)\n*```", text, re.DOTALL)
     for match in matches:
+        # 取围栏内的代码主体（match[0] 是可选的 python 标识）
         code_block = match[1]
         parsed_codes.append(code_block)
 
     # When the entire text is code or backticks of the code block is missing
     if len(parsed_codes) == 0:
+        # 没有匹配到围栏时，把整段文本当作（可能缺右围栏的）代码处理
         matches = re.findall(r"^(```(python)?)?\n?(.*?)\n?(```)?$", text, re.DOTALL)
         if matches:
+            # 取第 3 个捕获组（代码主体）
             code_block = matches[0][2]
             parsed_codes.append(code_block)
 
     # validate the parsed codes
+    # 逐块做语法校验，仅保留合法块，并用 black 统一格式化后拼接返回
     valid_code_blocks = [format_code(c) for c in parsed_codes if is_valid_python_script(c)]
     return format_code("\n\n".join(valid_code_blocks))
 
@@ -88,15 +113,19 @@ def extract_code(text):
 def extract_text_up_to_code(s):
     """Extract (presumed) natural language text up to the start of the first code block."""
     if "```" not in s:
+        # 文本中没有代码围栏时返回空（即没有独立的自然语言说明部分）
         return ""
+    # 截取第一个 ``` 之前的文本并去除首尾空白，视为方案说明
     return s[: s.find("```")].strip()
 
 
 def format_code(code) -> str:
     """Format Python code using Black."""
     try:
+        # 用 black 按标准风格格式化代码
         return black.format_str(code, mode=black.FileMode())
     except black.parsing.InvalidInput:  # type: ignore
+        # black 无法解析的输入（非 Python 语法）原样返回
         return code
 
 
@@ -113,18 +142,27 @@ def parse_thinking_tags(text):
         tuple: (thinking_text, text_without_thinking)
     """
     # Case 1: Both <think> and </think> exist
+    # 情形一：开闭标签齐全时提取标签内的思考内容
     match = re.search(r"<think>(.*?)</think>", text, re.DOTALL)
     if match:
+        # 取 <think> 与 </think> 之间的思考文本
         thinking_text = match.group(1).strip()
+        # 从原文中删除整个思考片段得到纯正文
         text_without_thinking = text.replace(match.group(0), "").strip()
+        # 返回（思考, 正文）二元组
         return thinking_text, text_without_thinking
 
     # Case 2: Missing <think> but has </think>
+    # 情形二：只出现 </think>（开头标签缺失/被截断），把 </think> 之前的内容当作思考
     match = re.search(r"(.*?)</think>", text, re.DOTALL)
     if match:
+        # 取 </think> 之前的文本作为思考内容
         thinking_text = match.group(1).strip()
+        # 从原文中删除该片段得到纯正文
         text_without_thinking = text.replace(match.group(0), "").strip()
+        # 返回（思考, 正文）二元组
         return thinking_text, text_without_thinking
 
     # Default case: No clear separation, return empty thinking and full text
+    # 兜底情形：没有任何思考标签分隔，思考为空、正文为整段去空白文本
     return "", text.strip()
