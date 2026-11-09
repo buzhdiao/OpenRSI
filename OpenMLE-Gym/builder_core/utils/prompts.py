@@ -1,3 +1,19 @@
+# 中文说明:本模块是 OpenMLE-Gym builder_core 的 prompt 模板库,集中存放环境构建器
+# (competition builder)在"把 Kaggle 风格原始竞赛数据加工为本地评测环境"的各阶段
+# 调用 LLM 所用的全部提示词与填参占位符。
+# 位置:builder_core/utils/prompts.py,被 builder_core 的构建管线导入。
+# 关键设计:
+# - 模板内 {xxx} 为 str.format 占位符,由构建器在运行期填充(如任务描述、样例);
+#   因此字符串本体一个字符都不能改,格式化解析依赖这些占位符与 <code>/</code> 标记;
+# - 多段 prompt 覆盖构建流水线各环节:文件盘点(perceiver)-> 任务描述生成 ->
+#   prepare.py 生成 -> metric.py 生成 -> 方案脚本生成 -> 模态/算力分类 ->
+#   进化阶段任务描述,各环节的输出被下一环节引用;
+# - 生成代码的 prompt 统一要求 <code>...</code> 包裹,下游用
+#   split("<code>")[1].split("</code>")[0] 提取,故模板中反复强调该约束。
+
+# 文件盘点员 prompt:让 LLM 以"技术文件系统审计员"身份系统化盘点 raw/ 目录,
+# 提取每个文件的元数据(行列数、表头、类型、前3行样例),不做主观解读,
+# 最终通过 "save" 工具把盘点结果写入 fileinfo.txt,供后续生成任务描述使用
 gen_perceiver = """
 You are a Technical File System Auditor. Your sole purpose is to perform a systematic inventory of a directory, extracting raw metadata and factual content without interpretive bias.
 
@@ -34,6 +50,9 @@ raw/core/train/
 """
 
 
+# 任务描述生成 prompt:让 LLM 从盘点/原始材料中提取"机器学习编程"所需的关键信息,
+# 按 {sample_description} 示例的格式输出结构化详细摘要(含评测细节),
+# 并强调 raw/ 起始的文件路径必须完整正确(下游按此路径引用文件)
 gen_description = """
 You are an excellent expert in text information summarization. Your task is to extract key information for **MACHINE LEARNING PROGRAMMING** from given textual materials, and produce a structured, DETAILED summary in the same format as the EXAMPLE.
 Make sure the Evaluation part covers all the details in the original content. 
@@ -43,6 +62,8 @@ Make sure the file path(start from raw/) is **COMPLETE** and **CORRECT**.
 {sample_description}
 """
 
+# 组合上下文模板:把任务描述、数据集描述、本地文件树、文件内容四段拼装成
+# 完整的任务说明上下文,供后续生成 prepare/metric/方案脚本时填充使用
 description_info = """
 ## Description, Evaluation and Submission Instructions: 
 {description}
@@ -58,6 +79,10 @@ description_info = """
 
 """
 
+# prepare.py 生成 prompt:让 LLM 写出完整可运行的 prepare(raw, public, private) 脚本,
+# 把 raw/ 原始数据重组为 data/public(训练侧可见)与 data/private(答案不可见)结构:
+# 含标签数据 80/20 划分、图文音模态同步切分、防答案泄漏、生成 description.txt 与
+# sample_submission.csv;输出同样要求 <code>...</code> 包裹以便机器提取
 gen_prepare_script = """
 You are a senior file organizer. Using the provided DESCRIPTION, write a complete, runnable `prepare.py` script to create a well-structured machine-learning competition environment from raw files.
 It should implement EXACTLY "def prepare(raw: Path, public: Path, private: Path)".
@@ -111,6 +136,9 @@ Finally (as is shown in the TARGET structure):
 {prepare_sample}
 """
 
+# metric.py 生成 prompt:让 LLM 按任务描述里的评测准则写出完整可运行的 metric.py,
+# 主体必须是类名以 'Metrics' 结尾的类(评测器按此约定发现并实例化),
+# 要处理 nan/inf 等数值边界,输出同样要求 <code>...</code> 包裹
 gen_metric_script = """
 You are a senior Python machine learning engineer. Write a complete, runnable `metric.py` script.
 
@@ -132,6 +160,8 @@ EXAMPLE OF YOUR RESPONSE:
 {metric_sample}
 """
 
+# 评测上下文模板:把"含评测准则的描述 + 提交样例 + 答案样例"拼给 metric 生成/校验环节,
+# 让 LLM 明确评测口径与两份 CSV 的列结构
 metric_info = """
 Descriptions including Evaluation Criteria: 
 {description}
@@ -144,6 +174,8 @@ Test Answer CSV Format:
 
 """
 
+# 附加信息模板:把模态、任务类型、文件大小、算力(CPU/GPU)等元信息追加到
+# 任务描述末尾,供方案生成等环节参考
 append_info = """
 
 ### Other Metadata
@@ -155,6 +187,10 @@ Using CPU/GPU: {cg}
 
 """
 
+# 参赛方案生成 prompt:让 LLM 写出生产级 Python 方案脚本解决该 ML 任务,
+# 硬性约束:数据根目录从 PUBLIC_ROOT 环境变量取、必须读 sample_submission.csv 对齐格式、
+# 预测 CSV 写到 SUBMISSION_PATH、脚本自包含、自动检测 CUDA、禁 GUI/额外落盘文件、
+# 固定保存逻辑、禁用 tensorflow;输出要求 <code>...</code> 包裹以便提取执行
 gen_solution_script = """
 ## Task Overview
 You are an expert machine learning engineer. Solve the following ML task with a production-ready Python script.
@@ -193,6 +229,9 @@ submission_df.to_csv(save_path, index=False)
 {solution_sample}
 """
 
+# 模态/任务类型分类 prompt(两段式列表):
+# 第[0]段要求分析描述并按 <out>模态@任务类型</out> 格式输出(可多模态、单任务类型),
+# 如 Graph@Regression、Image@Classification;第[1]段是待填充的任务描述占位
 gen_catg = ["""
 Analyze the description and identify the machine learning task's modality and type. 
 You may think before making decision, but the result must follow the format: [Modality]@[TaskType] and is wrapped in <out>, </out>.
@@ -209,6 +248,9 @@ Available task types (select one): Classification, Regression, Clustering, Segme
 "Description: {description}"
 ]
 
+# 算力判定 prompt(两段式列表):
+# 第[0]段要求根据任务描述判断需要 GPU 还是仅 CPU 即可,答案(精确的 "GPU"/"CPU")
+# 须包在 <out></out> 里便于解析;第[1]段填充任务描述并附文件大小作参考
 gen_ifgpu = ["""
 Based on the following machine learning task description, determine whether it requires a GPU or can run on a CPU alone. 
 You may think before making decision, but make sure to wrap the answer(exactly "GPU" or "CPU") in <out>, </out>,
@@ -217,6 +259,8 @@ Which is <out>GPU</out> or <out>CPU</out>
     "{description}\n File Size: {size}"
 ]
 
+# 进化阶段任务描述 prompt:tts_search/进化搜索在"持续改进代码拿更高分"阶段使用,
+# 只把任务描述填入 {description} 作为搜索迭代的上下文
 evolve_description = """
 You are an expert machine learning task solver. Read the following description of the ML task you are required to solve,
 and then continuously optimize a Python code to obtain better metrics. Description:
